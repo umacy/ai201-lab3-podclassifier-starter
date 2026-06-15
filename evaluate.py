@@ -56,9 +56,13 @@ def compute_accuracy(predictions: list[str], ground_truth: list[str]) -> float:
     Accuracy = number of correct predictions / total predictions.
     A prediction is correct when it exactly matches the ground truth label.
 
-    Before writing code, complete specs/evaluation-spec.md.
+    Returns 0.0 for an empty test set (guards against divide-by-zero).
     """
-    return 0.0
+    if not ground_truth:
+        return 0.0
+
+    correct = sum(p == t for p, t in zip(predictions, ground_truth))
+    return correct / len(ground_truth)
 
 
 def compute_per_class_accuracy(
@@ -81,9 +85,23 @@ def compute_per_class_accuracy(
         ...
       }
 
-    Before writing code, complete specs/evaluation-spec.md.
+    "correct"/"total" are measured per GROUND-TRUTH class (this is recall):
+    of the episodes that truly are label C, how many did we predict as C.
     """
-    return {label: {"correct": 0, "total": 0, "accuracy": 0.0} for label in VALID_LABELS}
+    stats = {label: {"correct": 0, "total": 0, "accuracy": 0.0} for label in VALID_LABELS}
+
+    for predicted, truth in zip(predictions, ground_truth):
+        if truth not in stats:
+            continue  # ignore "unknown" / out-of-vocabulary ground truth
+        stats[truth]["total"] += 1
+        if predicted == truth:
+            stats[truth]["correct"] += 1
+
+    for label in stats:
+        total = stats[label]["total"]
+        stats[label]["accuracy"] = stats[label]["correct"] / total if total else 0.0
+
+    return stats
 
 
 def format_evaluation_report(eval_results: dict) -> str:

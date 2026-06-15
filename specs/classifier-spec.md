@@ -91,10 +91,29 @@ the format below:" followed by the output format you chose.
 **What output format should you request from the LLM?**
 
 ```
-[blank — you need to parse the response in classify_episode(). What format
-makes parsing reliable? Think about: a single label on its own line?
-A structured format like "Label: X / Reasoning: Y"? JSON?
-What are the tradeoffs?]
+A two-line, prefix-labeled format:
+
+    Label: <one of interview | solo | panel | narrative>
+    Reasoning: <one or two sentences>
+
+I considered three options:
+
+  1. Bare label on its own line — trivial to parse, but throws away the
+     reasoning the output contract requires. Rejected.
+  2. JSON ({"label": ..., "reasoning": ...}) — clean if it parses, but
+     llama-3.3-70b frequently wraps JSON in ```json fences or adds a
+     sentence of preamble ("Here is the classification:"), which breaks
+     json.loads() and forces fence-stripping/regex anyway. More failure
+     modes, not fewer.
+  3. Prefix-labeled lines (chosen) — robust to extra whitespace, casing,
+     and stray prose. I parse by scanning lines for the "Label:" and
+     "Reasoning:" prefixes (case-insensitive) and taking the text after
+     the colon. Degrades gracefully: if the model omits the Reasoning
+     line I still recover the label; if it adds a preamble line I skip it.
+
+The format must match the example/output instruction in the prompt exactly
+so the model mirrors it. I will explicitly instruct: "Respond with exactly
+two lines, in this format, and nothing else."
 ```
 
 ---
@@ -102,8 +121,24 @@ What are the tradeoffs?]
 **Edge cases to handle in the prompt:**
 
 ```
-[blank — what if labeled_examples is empty? What if the description is very
-short? How does your prompt handle these?]
+- labeled_examples is empty: the prompt still works as a zero-shot prompt.
+  The task instruction already defines all four labels in plain language,
+  so the model can classify without examples — accuracy will be lower, but
+  it won't crash or produce a malformed prompt. I build the examples block
+  only if the list is non-empty; otherwise I omit that section entirely
+  (no dangling "Examples:" header with nothing under it).
+
+- Very short / empty description: I still present it under the same
+  Title/Description format and ask for a classification. A near-empty
+  description gives the model little to work with, so it will likely pick
+  the closest label or hedge — that's fine. classify_episode() validates
+  the returned label against VALID_LABELS and falls back to "unknown" if
+  the model can't commit, so a thin description can never crash parsing.
+
+- The new description could itself contain the strings "Label:" or
+  "Reasoning:". That only matters when parsing the RESPONSE, not the
+  prompt, so it doesn't affect prompt construction — but it's why the
+  parser scans the model's reply lines rather than the whole blob.
 ```
 
 ---
@@ -159,9 +194,30 @@ Extract the response text from:
 **Step 3 — Parse the response:**
 
 ```
-[blank — how do you extract the label and reasoning from the LLM's text output?
-What string operations or parsing logic do you need?
-This depends on the output format you chose in build_few_shot_prompt.]
+The chosen format is two prefix-labeled lines:
+    Label: <one of the four>
+    Reasoning: <a sentence or two>
+
+Parse by PREFIX, not position (the model may add a preamble line):
+
+  1. Split response.choices[0].message.content into lines.
+  2. For the label: find the first line whose stripped, lower-cased text
+     starts with "label:". Take the text after the colon, then normalize it:
+     lower-case, strip whitespace, and strip surrounding markdown/punctuation
+     (* # ` and a trailing period). Call this raw_label.
+  3. For the reasoning: find the first line starting with "reasoning:" and
+     take the text after the colon, stripped. If absent, leave reasoning as
+     an empty string (or fall back to the whole response text) — a missing
+     reasoning line must NOT prevent us from recovering the label.
+  4. Fallback if no "label:" line exists: scan the whole response for the
+     first whole-word, case-insensitive occurrence of one of VALID_LABELS
+     and use that as raw_label. This rescues replies that ignored the format
+     but still named a valid label.
+
+Why prefix-based: it tolerates conversational preamble ("Sure, here's the
+classification:"), stray markdown, and casing/whitespace drift, and it
+decouples label extraction from reasoning so a malformed reasoning line
+never costs us the label.
 ```
 
 ---
@@ -169,8 +225,21 @@ This depends on the output format you chose in build_few_shot_prompt.]
 **Step 4 — Validate the label:**
 
 ```
-[blank — what do you do if the LLM returns a label that isn't in VALID_LABELS?
-What should label be set to?]
+Snap the parsed raw_label to the fixed set:
+
+  - If raw_label is exactly one of VALID_LABELS (after the Step 3
+    normalization), use it as-is.
+  - Otherwise set label = "unknown".
+
+This is a strict membership check against config.VALID_LABELS — we never
+invent a label or "best-guess" a misspelling into a real class, because a
+silently wrong label is worse for evaluation than an honest "unknown".
+"unknown" is intentionally NOT in VALID_LABELS, so it shows up distinctly
+in the evaluation report (it can never count as a correct prediction).
+
+The reasoning is kept regardless of whether the label validated — even an
+"unknown" result carries whatever explanation the model gave, which is
+useful when debugging why a parse or classification failed.
 ```
 
 ---
@@ -178,9 +247,25 @@ What should label be set to?]
 **Step 5 — Handle errors gracefully:**
 
 ```
-[blank — what could go wrong? (Network error? Unparseable response?)
-What should the function return if something fails?
-Hint: the evaluation loop runs 20 calls — one bad response shouldn't crash everything.]
+Wrap the API call + parsing in a try/except so one bad episode can never
+crash the 20-call evaluation loop.
+
+What can go wrong, and the response:
+
+  - Network / API error (timeout, rate limit, auth failure, 5xx from Groq),
+    or the SDK raising: catch the exception and return
+      {"label": "unknown", "reasoning": "Error: <exception message>"}
+  - Empty or None response content (no choices, content is None): treat as
+    unparseable — return label "unknown" with a short note in reasoning.
+  - Unparseable text (no "label:" line AND no whole-word label match in the
+    fallback): label stays "unknown", reasoning holds the raw response so
+    we can see what the model actually said.
+
+In all failure paths the function still returns a well-formed dict with the
+required "label" and "reasoning" keys and a label of "unknown" — never None,
+never a raised exception. The evaluation loop counts "unknown" as a miss and
+keeps going, so partial failures degrade the accuracy score honestly instead
+of aborting the run.
 ```
 
 ---
